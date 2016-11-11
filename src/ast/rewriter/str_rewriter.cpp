@@ -411,6 +411,7 @@ br_status str_rewriter::mk_str_to_int(expr * arg0, expr_ref & result) {
 }
 
 br_status str_rewriter::mk_str_from_int(expr * arg0, expr_ref & result) {
+    /*
     TRACE("t_str_rw", tout << "rewrite (str.from-int " << mk_pp(arg0, m()) << ")" << std::endl;);
     rational arg0Int;
     if (m_autil.is_numeral(arg0, arg0Int)) {
@@ -427,6 +428,7 @@ br_status str_rewriter::mk_str_from_int(expr * arg0, expr_ref & result) {
         return BR_DONE;
     }
     return BR_FAILED;
+    */
 }
 
 br_status str_rewriter::mk_str_Substr(expr * base, expr * start, expr * len, expr_ref & result) {
@@ -578,9 +580,13 @@ br_status str_rewriter::mk_app_core(func_decl * f, unsigned num_args, expr * con
     case OP_STR_STR2INT:
     	SASSERT(num_args == 1);
     	return mk_str_to_int(args[0], result);
-    case OP_STR_INT2STR:
+    /*case OP_STR_INT2STR:
+
         SASSERT(num_args == 1);
         return mk_str_from_int(args[0], result);
+
+        NOT_IMPLEMENTED_YET(); return BR_FAILED;
+        */
     case OP_STR_SUBSTR:
         SASSERT(num_args == 3);
         return mk_str_Substr(args[0], args[1], args[2], result);
