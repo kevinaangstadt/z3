@@ -94,3 +94,6 @@ Z3-str/**
 tests
 tests/**
 
+/build.old/
+/build/
+/MAKE_README

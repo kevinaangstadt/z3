@@ -23,9 +23,16 @@ Revision History:
 #include<list>
 #include<vector>
 #include<algorithm>
+#include<bitset>
 
 #include "../ast/ast.h"
 #include"theory_arith.h"
+
+
+#include <sstream>
+
+#define SSTR( x ) static_cast< std::ostringstream & >(( std::ostringstream() << std::dec << x ) ).str()
+#define CHARBIT 8
 
 namespace smt {
 
@@ -61,7 +68,10 @@ theory_str::theory_str(ast_manager & m, theory_str_params const & params):
         cacheHitCount(0),
         cacheMissCount(0),
         m_find(*this),
-        m_trail_stack(*this)
+        m_trail_stack(*this),
+        // experimental stp based value tester - begin
+        testSTP (true)
+        // experimental stp based value tester - end
 {
     initialize_charset();
 }
@@ -2008,7 +2018,7 @@ expr * theory_str::get_eqc_next(expr * n) {
 }
 
 void theory_str::group_terms_by_eqc(expr * n, std::set<expr*> & concats, std::set<expr*> & vars, std::set<expr*> & consts) {
-    context & ctx = get_context();
+//    context & ctx = get_context();
     expr * eqcNode = n;
     do {
         app * ast = to_app(eqcNode);
@@ -8540,10 +8550,6 @@ void theory_str::collect_var_concat(expr * node, std::set<expr*> & varSet, std::
     }
     else if (is_app(node)) {
         app * aNode = to_app(node);
-        if (is_strlen(aNode)) {
-            // Length
-            return;
-        }
         if (is_concat(aNode)) {
             expr * arg0 = aNode->get_arg(0);
             expr * arg1 = aNode->get_arg(1);
@@ -8612,9 +8618,7 @@ bool theory_str::propagate_length(std::set<expr*> & varSet, std::set<expr*> & co
         if (! ctx.is_relevant(*it)) {
             continue;
         }
-        if (m.is_eq(*it)) {
-            collect_var_concat(*it, varSet, concatSet);
-        }
+        collect_var_concat(*it, varSet, concatSet);
     }
     // iterate each concat
     // if a concat doesn't have length info, check if the length of all leaf nodes can be resolved
@@ -8624,7 +8628,7 @@ bool theory_str::propagate_length(std::set<expr*> & varSet, std::set<expr*> & co
         expr_ref concatlenExpr (mk_strlen(concat), m) ;
         bool allLeafResolved = true;
         if (! get_value(concatlenExpr, lenValue)) {
-            // the length fo concat is unresolved yet
+            // the length of concat is unresolved yet
             if (get_len_value(concat, lenValue)) {
                 // but all leaf nodes have length information
                 TRACE("t_str_length", tout << "* length pop-up: " <<  mk_ismt2_pp(concat, m) << "| = " << lenValue << std::endl;);
@@ -8652,22 +8656,63 @@ bool theory_str::propagate_length(std::set<expr*> & varSet, std::set<expr*> & co
                     axiomAdded = true;
                 }
             }
+        } else {
+//            rational dummyLenValue;
+//            if (! get_len_value(concat, dummyLenValue)) {
+//                TRACE("t_str_length", tout << "Propagate chance: |" <<  mk_ismt2_pp(concat, m) << "| = " << lenValue << std::endl; );
+//            }
+            // check if it's possible to propagate length from parents to its children
+            expr_ref_vector l_items(m);
+            // parent length assertion
+            expr_ref parentLenExpr (mk_strlen(concat), m);
+            expr_ref parentLenValueExpr (mk_int(lenValue), m);
+            expr_ref lcExpr (ctx.mk_eq_atom(parentLenExpr, parentLenValueExpr), m);
+            l_items.push_back(lcExpr);
+            int remainingLen = lenValue.get_int32();
+
+            ptr_vector<expr> childrenVector;
+            get_nodes_in_concat(concat, childrenVector);
+            expr * exprToDo = NULL;
+            int cntToDo = 0;
+            for (unsigned int i = 0; i < childrenVector.size(); i++) {
+                expr * child = childrenVector.get(i);
+                rational childLenValue;
+                if (get_len_value(child, childLenValue)) {
+                    expr_ref childLen (mk_strlen(child), m) ;
+                    expr_ref childLenValueExpr (mk_int(childLenValue), m);
+                    expr_ref Expr (ctx.mk_eq_atom(childLen, childLenValueExpr), m);
+                    l_items.push_back(lcExpr);
+                    remainingLen = remainingLen - childLenValue.get_int32();
+                } else {
+                    exprToDo = child;
+                    cntToDo++;
+                }
+            }
+            if (cntToDo == 1 && remainingLen >= 0) {
+                expr_ref axl(m.mk_and(l_items.size(), l_items.c_ptr()), m);
+                expr_ref childLen (mk_strlen(exprToDo), m) ;
+                expr_ref lenValueExpr (mk_int(remainingLen), m);
+                expr_ref axr(ctx.mk_eq_atom(childLen, lenValueExpr), m);
+                assert_implication(axl, axr);
+                TRACE("t_str_length", tout << "Propagate down: " <<  mk_ismt2_pp(axl, m) << std::endl
+                                           << "  --->  " << std::endl <<  mk_ismt2_pp(axr, m)<< std::endl;);
+                axiomAdded = true;
+            }
         }
     }
+
     // if no concat length is propagated, check the length of variables.
     if (! axiomAdded) {
         for (std::set<expr*>::iterator it = varSet.begin(); it != varSet.end(); it++) {
             expr * var = *it;
             rational lenValue;
             expr_ref varlen (mk_strlen(var), m) ;
-            bool allLeafResolved = true;
             if (! get_value(varlen, lenValue)) {
                 if (propagate_length_within_eqc(var)) {
                     axiomAdded = true;
                 }
             }
         }
-
     }
     return axiomAdded;
 }
@@ -9035,11 +9080,14 @@ final_check_status theory_str::final_check_eh() {
     }
 
     // --------
-    // experimental free variable assignment - begin
+    // experimental stp based value tester - begin
     //   * special handling for variables that are not used in concat
     // --------
-    bool testAssign = true;
-    if (!testAssign) {
+    bool hasRegex = ! unrollGroup_map.empty();
+    if (!testSTP || hasRegex) {
+        if (testSTP) {
+            TRACE("t_str", tout << "Regex FOUND. Use regular value testers" << std::endl;);
+        }
     	for (std::map<expr*, int>::iterator fvIt = freeVar_map.begin(); fvIt != freeVar_map.end(); fvIt++) {
     		expr * freeVar = fvIt->first;
     		/*
@@ -9057,7 +9105,7 @@ final_check_status theory_str::final_check_eh() {
     } else {
     	process_free_var(freeVar_map);
     }
-    // experimental free variable assignment - end
+    // experimental stp based value tester - end
 
     // now deal with removed free variables that are bounded by an unroll
     TRACE("t_str", tout << "fv_unrolls_map (#" << fv_unrolls_map.size() << "):" << std::endl;);
@@ -10309,17 +10357,491 @@ expr * theory_str::gen_len_val_options_for_free_var(expr * freeVar, expr * lenTe
             } else {
                 TRACE("t_str", tout << "length is fixed; generating models for free var" << std::endl;);
                 // length is fixed
-                expr * valueAssert = gen_free_var_options(freeVar, effectiveLenInd, effectiveLenIndiStr, NULL, "");
-                return valueAssert;
+                if (! testSTP) {
+                	expr * valueAssert = gen_free_var_options(freeVar, effectiveLenInd, effectiveLenIndiStr, NULL, "");
+                	return valueAssert;
+                } else {
+                	return NULL;
+                }
             }
         } // fVarLenCountMap.find(...)
 
 	} // !UseBinarySearch
 }
 
-void theory_str::get_concats_in_eqc(expr * n, std::set<expr*> & concats) {
-    context & ctx = get_context();
+// experimental stp based value tester - begin
 
+void theory_str::collect_expr_length(std::set<expr*> & varSet, std::set<expr*> & concatSet, std::map<expr*, int> & exprLenMap) {
+    ast_manager & m = get_manager();
+    // variables
+    for (std::set<expr*>::iterator it = varSet.begin(); it != varSet.end(); ++it) {
+        expr* var = *it;
+        rational lenValue;
+        bool hasLen = get_len_value(var, lenValue);
+        if (hasLen) {
+            exprLenMap[var] = lenValue.get_int32();
+        }
+    }
+    // concat
+    for (std::set<expr*>::iterator it = concatSet.begin(); it != concatSet.end(); it++) {
+        expr * concat = *it;
+        expr_ref concatlen(m);
+        concatlen = mk_strlen(concat);
+        rational concatLenValue;
+        if (get_value(concatlen, concatLenValue)) {
+            exprLenMap[concat] = concatLenValue.get_int32();
+        }
+    }
+
+    TRACE("t_str_length",
+            tout << "* variable length:" << std::endl;
+            for(std::set<expr*>::iterator it = varSet.begin(); it != varSet.end(); ++it) {
+                expr* var = *it; rational lenValue;
+                bool hasLen = get_len_value(var, lenValue);
+                if (hasLen) {
+                    tout << "  - |" << mk_ismt2_pp(var, m) << "| = " << lenValue << std::endl;
+                } else {
+                    tout << "  - |" << mk_ismt2_pp(var, m) << "| = UNKNOWN" << std::endl;
+                }
+            } tout << std::endl;
+
+            tout << "* concat length:" << std::endl;
+            for (std::set<expr*>::iterator it = concatSet.begin(); it != concatSet.end(); it++) {
+                expr * concat = *it;
+                expr_ref concatlen(m) ;
+                concatlen = mk_strlen(concat);
+                rational concatLenValue;
+                if (get_value(concatlen, concatLenValue)) {
+                    tout << "  - |" << mk_ismt2_pp(concat, m) << "| = " << concatLenValue << std::endl;
+                } else {
+                    tout << "  - |" << mk_ismt2_pp(concat, m) << "| = UNKNOWN" << std::endl;
+                }
+            }
+            tout << std::endl;
+     );
+}
+
+
+void theory_str::collect_non_lenTest_vars_in_expr(expr * node, std::set<expr*> & varSet) {
+    if (variable_set.find(node) != variable_set.end()) {
+        if (internal_lenTest_vars.find(node) == internal_lenTest_vars.end()) {
+            varSet.insert(node);
+        }
+    } else if (is_app(node)) {
+        app * aNode = to_app(node);
+        for (unsigned i = 0; i < aNode->get_num_args(); ++i) {
+            expr * arg = aNode->get_arg(i);
+            collect_non_lenTest_vars_in_expr(arg, varSet);
+        }
+    }
+}
+
+
+void theory_str::collect_external_vars_in_expr(expr * node, std::set<expr*> & varSet) {
+    if (variable_set.find(node) != variable_set.end()) {
+        if (internal_variable_set.find(node) == internal_variable_set.end()) {
+            varSet.insert(node);
+        }
+    } else if (is_app(node)) {
+        app * aNode = to_app(node);
+        for (unsigned i = 0; i < aNode->get_num_args(); ++i) {
+            expr * arg = aNode->get_arg(i);
+            collect_external_vars_in_expr(arg, varSet);
+        }
+    }
+}
+
+
+void theory_str::collect_external_vars_in_length(expr * node, std::set<expr*> & varSet) {
+    if (is_app(node)) {
+        app * aNode = to_app(node);
+        if (is_strlen(aNode)) {
+            collect_external_vars_in_expr(aNode, varSet);
+        }
+        for (unsigned i = 0; i < aNode->get_num_args(); ++i) {
+            expr * arg = aNode->get_arg(i);
+            collect_external_vars_in_length(arg, varSet);
+        }
+    }
+}
+
+
+bool theory_str::skip_in_bv_integration(expr * node, std::set<expr *> & wl_vars) {
+    ast_manager & m = get_manager();
+    if (internal_lenTest_vars.find(node) != internal_lenTest_vars.end()) {
+        return true;
+    } else if (is_app(node)) {
+        app * aNode = to_app(node);
+        if (is_strlen(aNode)) {
+            collect_external_vars_in_length(node, wl_vars);
+            TRACE("t_str_length", tout << "SKIP(is_strlen): " << mk_ismt2_pp(node, m) << std::endl;);
+            return true;
+        } else if (is_CharAt(aNode)) {
+            return true;
+        } else if (is_Unroll(aNode)) {
+            return true;
+        } else if (m_autil.is_arith_expr(aNode)) {
+            TRACE("t_str_length", tout << "SKIP(is_arith_expr): " << mk_ismt2_pp(node, m) << std::endl;);
+            collect_external_vars_in_length(node, wl_vars);
+            return true;
+        } else if (is_EndsWith(aNode)) {
+            return true;
+        }
+        for (unsigned i = 0; i < aNode->get_num_args(); ++i) {
+            expr * arg = aNode->get_arg(i);
+            if (skip_in_bv_integration(arg, wl_vars)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+
+void theory_str::value_tester_prepartion(std::set<expr *> & wl_vars, expr_ref_vector & wl_assertions) {
+    context & ctx = get_context();
+    ast_manager & m = get_manager();
+    expr_ref_vector assignments(m);
+    ctx.get_assignments(assignments);
+
+    // select interesting assertions
+    for (expr_ref_vector::iterator it = assignments.begin(); it != assignments.end(); ++it) {
+        expr * ae = *it;
+        if (!ctx.is_relevant(ae)) {
+            continue;
+        }
+        if (m.is_or(ae) || m.is_and(ae)) {
+            continue;
+        }
+        if (m.is_iff(ae)) {
+            continue;
+        }
+
+        TRACE("t_str_length", tout << "family id = " << to_app(ae)->get_family_id()
+                                   << ", decl_kind = " << to_app(ae)->get_decl_kind() << std::endl
+                                   << mk_ismt2_pp(ae, m) << std::endl;);
+
+
+        if (skip_in_bv_integration(ae, wl_vars)) {
+            continue;
+        }
+        if (m.is_eq(ae)) {
+            expr_ref eq_expr(ae, m);
+            wl_assertions.push_back(eq_expr);
+            collect_non_lenTest_vars_in_expr(ae, wl_vars);
+
+        } else if (m.is_not(ae)) {
+            expr_ref noteq_expr(ae, m);
+            wl_assertions.push_back(noteq_expr);
+            collect_non_lenTest_vars_in_expr(ae, wl_vars);
+        }
+    }
+    // debug print: the assignment to be translated
+    TRACE("t_str_length",
+            tout << "STP Translation:" << std::endl;
+            tout << "***********************" << std::endl;
+            for (std::set<expr *>::iterator varIt = wl_vars.begin(); varIt != wl_vars.end(); varIt++) {
+                tout << mk_ismt2_pp(*varIt, m) << ", ";
+            }
+            tout << std::endl << "-----------------------" << std::endl;
+            for (expr_ref_vector::iterator aeIt = wl_assertions.begin(); aeIt != wl_assertions.end(); aeIt++) {
+                tout << mk_ismt2_pp(*aeIt, m) << std::endl;
+            }
+            tout << "***********************" << std::endl;
+    );
+}
+
+
+Expr theory_str::stp_var_basic_fact(VC vc, std::string varName, Expr varExpr, int len) {
+    Expr zeroExpr = vc_bvConstExprFromStr(vc, "00000000");
+    Expr res = NULL;
+    if (len <= 0) {
+        return NULL;
+    } else if (len == 1) {
+        res = vc_notExpr(vc, vc_eqExpr(vc, varExpr, zeroExpr));
+    } else {
+        std::string vnPrefix = varName + "_" + SSTR(len) + "_";
+        Expr concatExpr = NULL;
+        for (int i = 0; i < len; i++) {
+            std::string vn = vnPrefix + SSTR(i);
+            Expr cVar = vc_varExpr(vc, vn.c_str(), vc_bvType(vc, CHARBIT));
+            Expr cVarNotNull = vc_notExpr(vc, vc_eqExpr(vc, cVar, zeroExpr));
+            if (res == NULL) {
+                res = cVarNotNull;
+            } else {
+                res = vc_andExpr(vc, res, cVarNotNull);
+            }
+            if (concatExpr == NULL) {
+                concatExpr = cVar;
+            } else {
+                concatExpr = vc_bvConcatExpr(vc, concatExpr, cVar);
+            }
+        }
+        Expr varEqConcat = vc_eqExpr(vc, varExpr, concatExpr);
+        res = vc_andExpr(vc, res, varEqConcat);
+    }
+    return res;
+}
+
+
+Expr theory_str::convert_to_stp_expr(VC vc, expr * node, std::map<expr*, int> & exprLenMap, std::set<expr *> & varExprSet) {
+    ast_manager & m = get_manager();
+
+    if (m_strutil.is_string(node)) {
+        const char * strval = 0;
+        m_strutil.is_string(node, &strval);
+        if (strlen(strval) == 0) {
+            return NULL;
+        }
+        std::string convertedStr = "";
+        for (unsigned int i = 0; i < strlen(strval); i++) {
+            convertedStr = convertedStr + std::bitset<8>(strval[i]).to_string();
+        }
+        return vc_bvConstExprFromStr(vc, convertedStr.c_str());
+    } else if (variable_set.find(node) != variable_set.end()) {
+        if (exprLenMap.find(node) != exprLenMap.end()) {
+            int len = exprLenMap[node];
+            if (len > 0) {
+                varExprSet.insert(node);
+                symbol varname = to_app(node)->get_decl()->get_name();
+                return vc_varExpr(vc, (const char *) varname.c_ptr(), vc_bvType(vc, len * CHARBIT));
+            } else {
+                return NULL;
+            }
+        } else {
+            TRACE("t_str_length", tout << "no cached length info found for " << mk_ismt2_pp(node, m) << std::endl;);
+        }
+    } else if (is_concat(to_app(node))) {
+        ptr_vector<expr> concat1Args;
+        get_nodes_in_concat(node, concat1Args);
+        Expr res = NULL;
+        for (expr_ref_vector::iterator it = concat1Args.begin(); it != concat1Args.end(); it++) {
+            Expr itExpr = convert_to_stp_expr(vc, *it, exprLenMap, varExprSet);
+            if (itExpr == NULL) {
+                continue;
+            }
+            if (res == NULL) {
+                res = itExpr;
+            } else {
+                res = vc_bvConcatExpr(vc, res, itExpr);
+            }
+        }
+        return res;
+    }
+    return NULL;
+}
+
+
+bool theory_str::gen_string_value_option(std::set<expr*> & wl_vars, expr_ref_vector & wl_assertions, std::map<expr*, int> & exprLenMap) {
+    context & ctx = get_context();
+    ast_manager & m = get_manager();
+    expr_ref_vector implyLeftItems(m);
+
+    implyLeftItems.append(wl_assertions);
+
+    VC vc = vc_createValidityChecker();
+    Expr queryExpr = NULL;
+
+    std::set<expr *> varExprSet;
+    for (expr_ref_vector::iterator aeIt = wl_assertions.begin(); aeIt != wl_assertions.end(); aeIt++) {
+        expr * item = *aeIt;
+
+        TRACE("t_str_length", tout << "Converting" << std::endl;
+            tout << mk_ismt2_pp(*aeIt, m) << std::endl;);
+
+        Expr itemExpr = NULL;
+        if (m.is_eq(item)) {
+            app * aNode = to_app(item);
+            Expr eqLhs = convert_to_stp_expr(vc, aNode->get_arg(0), exprLenMap, varExprSet);
+            Expr eqRhs = convert_to_stp_expr(vc, aNode->get_arg(1), exprLenMap, varExprSet);
+            if (eqLhs != NULL && eqRhs != NULL) {
+                itemExpr = vc_eqExpr(vc, eqLhs, eqRhs);
+            }
+        } else if (m.is_not(item)) {
+            app * aNode = to_app(item);
+            expr * arg = aNode->get_arg(0);
+            if (m.is_eq(arg)) {
+                app * arg_app = to_app(arg);
+                expr * disEqArg0 = arg_app->get_arg(0);
+                expr * disEqArg1 = arg_app->get_arg(1);
+                if (exprLenMap.find(disEqArg0) != exprLenMap.end() && exprLenMap.find(disEqArg1) != exprLenMap.end()) {
+                    if (exprLenMap[disEqArg0] == exprLenMap[disEqArg1]) {
+                        Expr notEq_Lhs = convert_to_stp_expr(vc, disEqArg0, exprLenMap, varExprSet);
+                        Expr notEq_Rhs = convert_to_stp_expr(vc, disEqArg1, exprLenMap, varExprSet);
+                        if (notEq_Lhs != NULL && notEq_Rhs != NULL) {
+                            itemExpr = vc_notExpr(vc, vc_eqExpr(vc, notEq_Lhs, notEq_Rhs));
+                        }
+                    }
+                }
+            }
+        }
+
+        if (itemExpr == NULL) {
+            continue;
+        }
+
+        if (queryExpr == NULL) {
+            queryExpr = itemExpr;
+        } else {
+            queryExpr = vc_andExpr(vc, queryExpr, itemExpr);
+        }
+    }
+
+    TRACE("t_str_length",
+            tout << "STP var candidates for basic fact assertion: " << std::endl;
+            for (std::set<expr *>::iterator it = varExprSet.begin(); it != varExprSet.end(); it++) {
+                tout << mk_ismt2_pp(*it, m) << ", ";
+            }
+            tout << std::endl;
+         );
+
+    std::map<expr *, Expr> z3Var2STPVarMap;
+    for (std::set<expr *>::iterator it = varExprSet.begin(); it != varExprSet.end(); it++) {
+        expr * var = *it;
+        int len = exprLenMap[var];
+        if (len > 0) {
+            std::string z3VarName = std::string((const char *) to_app(var)->get_decl()->get_name().c_ptr());
+            Expr varExpr = vc_varExpr(vc, z3VarName.c_str(), vc_bvType(vc, len * CHARBIT));
+            Expr basicFact = stp_var_basic_fact(vc, z3VarName, varExpr, len);
+            if (queryExpr == NULL) {
+                queryExpr = basicFact;
+            } else {
+                queryExpr = vc_andExpr(vc, queryExpr, basicFact);
+            }
+            // remember the corresponding STP variables
+            z3Var2STPVarMap[var] = varExpr;
+            if (exprLenMap.find(var) != exprLenMap.end()) {
+                expr_ref varLenExpr(mk_strlen(var), m);
+                expr_ref lenValueExpr(mk_int(exprLenMap[var]), m);
+                expr_ref lenValue(ctx.mk_eq_atom(varLenExpr, lenValueExpr), m);
+                implyLeftItems.push_back(lenValue);
+            }
+        }
+    }
+
+    TRACE("t_str_length", tout << "Basic Var STP Expr Added" << std::endl;);
+
+    for (std::map<expr*, int>::iterator it = exprLenMap.begin(); it != exprLenMap.end(); it++) {
+        expr * expr = it->first;
+        int expr_len = it->second;
+        if (expr_len == 0) {
+            continue;
+        }
+        if (wl_vars.find(expr) == wl_vars.end()) {
+            continue;
+        }
+        if (varExprSet.find(expr) == varExprSet.end()) {
+
+            TRACE("t_str_length", tout << "Extra dummy assertion: " << mk_ismt2_pp(expr, m)  << " = " << mk_ismt2_pp(expr, m) << std::endl;);
+
+            std::string z3VarName = std::string((const char *) to_app(expr)->get_decl()->get_name().c_ptr());
+            Expr varExpr = vc_varExpr(vc, z3VarName.c_str(), vc_bvType(vc, expr_len * CHARBIT));
+            z3Var2STPVarMap[expr] = varExpr;
+            Expr basicFact = stp_var_basic_fact(vc, z3VarName, varExpr, expr_len);
+
+            if (queryExpr == NULL) {
+                queryExpr = basicFact;
+            } else {
+                queryExpr = vc_andExpr(vc, queryExpr, basicFact);
+            }
+
+            expr_ref varLenExpr(mk_strlen(expr), m);
+            expr_ref lenValueExpr(mk_int(expr_len), m);
+            expr_ref lenValue(ctx.mk_eq_atom(varLenExpr, lenValueExpr), m);
+            implyLeftItems.push_back(lenValue);
+        }
+    }
+
+    if (queryExpr == NULL) {
+        TRACE("t_str_length", tout << "NO STP Expr Generated" << std::endl;);
+        return false;
+    }
+
+    Expr finalQuery = vc_notExpr(vc, queryExpr);
+    int ret = vc_query(vc, finalQuery);
+    if (ret == false) {
+
+        TRACE("t_str_length", char * bufPtr; unsigned long bufLen;
+            vc_printCounterExampleToBuffer(vc, &bufPtr, &bufLen);
+            tout << "STP Solution" << std::endl
+                 << "=======================" << std::endl
+                 << bufPtr << "=======================" << std::endl;
+            free(bufPtr););
+
+        expr_ref_vector items(m);
+        int errorFound = 0;
+        for (std::map<expr *, Expr>::iterator it = z3Var2STPVarMap.begin(); it != z3Var2STPVarMap.end(); it++) {
+            expr * var = it->first;
+            Expr ce = vc_getCounterExample(vc, it->second);
+            int bvLen = vc_getBVLength(vc, ce);
+            if (bvLen % CHARBIT == 0) {
+                int strLen = bvLen / CHARBIT;
+                std::string bvStr = "";
+                for (int i = strLen; i > 0; i--) {
+                    int high_idx = i * CHARBIT - 1;
+                    int low_idx = (i - 1) * CHARBIT;
+                    Expr aBit = vc_bvExtract(vc, ce, high_idx, low_idx);
+                    char charVal = (char) getBVInt(aBit);
+                    bvStr.push_back(charVal);
+                }
+
+                expr_ref bvStrExpr(mk_string(bvStr), m);
+                expr_ref strValue(ctx.mk_eq_atom(var, bvStrExpr), m);
+                items.push_back(strValue);
+            } else {
+                errorFound = 1;
+                TRACE("t_str_length", tout << "Error: (the length of the assignment of " << mk_ismt2_pp(var, m) << ") % 8 != 0" << std::endl;);
+            }
+        }
+        if (errorFound == 0) {
+            expr_ref imply_l (mk_and(implyLeftItems), m);
+            expr_ref imply_r (mk_and(items), m);
+
+            TRACE("t_str_length", tout << "imply_LHS: " << std::endl << mk_ismt2_pp(imply_l, m)
+                    << std::endl << "imply_RHS: " << std::endl << mk_ismt2_pp(imply_r, m) << std::endl;);
+
+            assert_implication(imply_l, imply_r);
+        }
+    } else {
+        TRACE("t_str_length", tout << "ERROR. No STP solution" << std::endl;);
+    }
+    vc_Destroy(vc);
+    return true;
+}
+
+
+void theory_str::resolve_string_value() {
+    ast_manager & m = get_manager();
+    std::set<expr*> varSet;
+    std::set<expr*> concatSet;
+    std::map<expr*, int> exprLenMap;
+    bool lenPropagated = propagate_length(varSet, concatSet, exprLenMap);
+    bool allVarLengResoved = true;
+    if (! lenPropagated) {
+        std::set<expr *> wl_vars;
+        expr_ref_vector wl_assertions(m);
+        value_tester_prepartion(wl_vars, wl_assertions);
+        for (std::set<expr *>::iterator it = wl_vars.begin(); it != wl_vars.end(); it++) {
+            expr * var = *it;
+            rational lenValue;
+            expr_ref varlen (mk_strlen(var), m) ;
+            if (! get_value(varlen, lenValue)) {
+                TRACE("t_str_length", tout << "len(" << mk_ismt2_pp(var, m) << ") = UNKNOWN. Not Ready Yet" << std::endl;);
+                allVarLengResoved = false;
+                break;
+            }
+        }
+        if (allVarLengResoved) {
+            collect_expr_length(varSet, concatSet, exprLenMap);
+            gen_string_value_option(wl_vars, wl_assertions, exprLenMap);
+        }
+    }
+}
+
+//experimental stp based value tester - end
+
+
+void theory_str::get_concats_in_eqc(expr * n, std::set<expr*> & concats) {
     expr * eqcNode = n;
     do {
         if (is_concat(to_app(eqcNode))) {
@@ -10330,8 +10852,6 @@ void theory_str::get_concats_in_eqc(expr * n, std::set<expr*> & concats) {
 }
 
 void theory_str::get_var_in_eqc(expr * n, std::set<expr*> & varSet) {
-	context & ctx = get_context();
-
 	expr * eqcNode = n;
 	do {
 		if (variable_set.find(eqcNode) != variable_set.end()) {
@@ -10419,7 +10939,7 @@ void theory_str::process_free_var(std::map<expr*, int> & freeVar_map) {
 	}
 
 	// TODO here's a great place for debugging info
-
+	bool lenTestAdded = false;
 	// testing: iterate over leafVarSet deterministically
 	if (false) {
 	    // *** TESTING CODE
@@ -10435,6 +10955,7 @@ void theory_str::process_free_var(std::map<expr*, int> & freeVar_map) {
 	        // as methods that it calls may assert their own axioms instead.
 	        if (toAssert != NULL) {
 	            assert_axiom(toAssert);
+	            lenTestAdded = true;
 	        }
 	    }
 	} else {
@@ -10446,6 +10967,7 @@ void theory_str::process_free_var(std::map<expr*, int> & freeVar_map) {
 	        // as methods that it calls may assert their own axioms instead.
 	        if (toAssert != NULL) {
 	            assert_axiom(toAssert);
+	            lenTestAdded = true;
 	        }
 	    }
 	}
@@ -10458,8 +10980,14 @@ void theory_str::process_free_var(std::map<expr*, int> & freeVar_map) {
 			// same deal with returning a NULL axiom here
 			if(toAssert != NULL) {
 			    assert_axiom(toAssert);
+			    lenTestAdded = true;
 			}
 		}
+	}
+	if (! lenTestAdded) {
+		/***** experiment: value resolving begin *****/
+	    resolve_string_value();
+		/***** experiment: value resolving end *****/
 	}
 }
 
@@ -10470,8 +10998,6 @@ void theory_str::process_free_var(std::map<expr*, int> & freeVar_map) {
 void theory_str::get_eqc_allUnroll(expr * n, expr * &constStr, std::set<expr*> & unrollFuncSet) {
     constStr = NULL;
     unrollFuncSet.clear();
-    context & ctx = get_context();
-
     expr * curr = n;
     do {
         if (is_string(to_app(curr))) {
@@ -10489,8 +11015,6 @@ void theory_str::get_eqc_allUnroll(expr * n, expr * &constStr, std::set<expr*> &
 void theory_str::get_eqc_simpleUnroll(expr * n, expr * &constStr, std::set<expr*> & unrollFuncSet) {
 	constStr = NULL;
 	unrollFuncSet.clear();
-	context & ctx = get_context();
-
 	expr * curr = n;
 	do {
 		if (is_string(to_app(curr))) {

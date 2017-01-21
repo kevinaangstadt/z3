@@ -30,6 +30,8 @@ Revision History:
 #include"str_rewriter.h"
 #include"union_find.h"
 
+#include "stp/c_interface.h"
+
 // TODO refactor: anything that returns an expr* instead returns an expr_ref
 
 namespace smt {
@@ -588,6 +590,25 @@ namespace smt {
         bool propagate_length(std::set<expr*> & varSet, std::set<expr*> & concatSet, std::map<expr*, int> & exprLenMap);
         void get_unique_non_concat_nodes(expr * node, std::set<expr*> & argSet);
         bool propagate_length_within_eqc(expr * var);
+
+        // experimental stp based value tester - begin
+        bool testSTP;
+        void collect_expr_length(std::set<expr*> & varSet, std::set<expr*> & concatSet, std::map<expr*, int> & exprLenMap);
+
+        // collect vars and assertions in context to be translated
+        void collect_non_lenTest_vars_in_expr(expr * node, std::set<expr*> & varSet);
+        void collect_external_vars_in_expr(expr * node, std::set<expr*> & varSet);
+        void collect_external_vars_in_length(expr * node, std::set<expr*> & varSet);
+        void value_tester_prepartion(std::set<expr *> & wl_vars, expr_ref_vector & wl_assetions);
+        bool skip_in_bv_integration(expr * node, std::set<expr *> & wl_vars);
+
+        // stp constraint generation
+        Expr stp_var_basic_fact (VC vc, std::string varName, Expr varExpr, int len);
+        Expr convert_to_stp_expr(VC vc, expr * item, std::map<expr*, int> & exprLenMap, std::set<expr *> & varExprSet);
+        bool gen_string_value_option(std::set<expr*> & wl_vars, expr_ref_vector & wl_assetions, std::map<expr*, int> & exprLenMap);
+
+        void resolve_string_value();
+        // experimental stp based value tester - end
 
         // TESTING
         void refresh_theory_var(expr * e);

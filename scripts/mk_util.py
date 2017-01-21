@@ -749,6 +749,8 @@ def extract_c_includes(fname):
     for line in f:
         m1 = std_inc_pat.match(line)
         if m1:
+            if m1.group(1) == "stp/c_interface.h":
+                continue
             result.append(m1.group(1))
         elif not system_inc_pat.match(line) and non_std_inc_pat.match(line):
             raise MKException("Invalid #include directive at '%s':%s" % (fname, line))
@@ -2344,7 +2346,7 @@ def mk_config():
             CXXFLAGS       = '%s -fno-strict-aliasing -D_LINUX_' % CXXFLAGS
             OS_DEFINES     = '-D_LINUX_'
             SO_EXT         = '.so'
-            LDFLAGS        = '%s -lrt' % LDFLAGS
+            LDFLAGS        = '%s -lrt -lstp' % LDFLAGS
             SLIBFLAGS      = '-shared'
             SLIBEXTRAFLAGS = '%s -lrt' % SLIBEXTRAFLAGS
         elif sysname == 'FreeBSD':
