@@ -1978,6 +1978,11 @@ public:
                         res = iproof->make_axiom(lits); // for array extensionality axiom
                     break;
                 }
+                case StringTheory: { // Kevin testing
+                    std::cout << "yay! we made it this far" << std::endl;
+                    res = iproof->make_axiom(lits,ast_scope(con));
+                    break;
+                }
                 default:
                     throw unsupported();
                 }
