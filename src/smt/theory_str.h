@@ -27,30 +27,50 @@ Revision History:
 #include<set>
 #include<stack>
 #include<vector>
-#include"str_rewriter.h"
+#include<map>
+#include"seq_decl_plugin.h"
 #include"union_find.h"
-
-// TODO refactor: anything that returns an expr* instead returns an expr_ref
 
 namespace smt {
 
+    typedef hashtable<symbol, symbol_hash_proc, symbol_eq_proc> symbol_set;
+
     class str_value_factory : public value_factory {
-        str_util m_util;
+        seq_util u;
+        symbol_set m_strings;
+        std::string delim;
+        unsigned m_next;
     public:
         str_value_factory(ast_manager & m, family_id fid) :
             value_factory(m, fid),
-            m_util(m) {}
+            u(m), delim("!"), m_next(0) {}
         virtual ~str_value_factory() {}
         virtual expr * get_some_value(sort * s) {
-            return m_util.mk_string("some value");
+            return u.str.mk_string(symbol("some value"));
         }
         virtual bool get_some_values(sort * s, expr_ref & v1, expr_ref & v2) {
-            v1 = m_util.mk_string("value 1");
-            v2 = m_util.mk_string("value 2");
+            v1 = u.str.mk_string(symbol("value 1"));
+            v2 = u.str.mk_string(symbol("value 2"));
             return true;
         }
         virtual expr * get_fresh_value(sort * s) {
-            return m_util.mk_fresh_string();
+            if (u.is_string(s)) {
+                while (true) {
+                    std::ostringstream strm;
+                    strm << delim << std::hex << (m_next++) << std::dec << delim;
+                    symbol sym(strm.str().c_str());
+                    if (m_strings.contains(sym)) continue;
+                    m_strings.insert(sym);
+                    return u.str.mk_string(sym);
+                }
+            }
+            sort* seq = 0;
+            if (u.is_re(s, seq)) {
+                expr* v0 = get_fresh_value(seq);
+                return u.re.mk_to_re(v0);
+            }
+            TRACE("t_str", tout << "unexpected sort in get_fresh_value(): " << mk_pp(s, m_manager) << std::endl;);
+            UNREACHABLE(); return NULL;
         }
         virtual void register_value(expr * n) { /* Ignore */ }
     };
@@ -97,6 +117,52 @@ namespace smt {
         }
     };
 
+
+    class nfa {
+    protected:
+        bool m_valid;
+        unsigned m_next_id;
+
+        unsigned next_id() {
+            unsigned retval = m_next_id;
+            ++m_next_id;
+            return retval;
+        }
+
+        unsigned m_start_state;
+        unsigned m_end_state;
+
+        std::map<unsigned, std::map<char, unsigned> > transition_map;
+        std::map<unsigned, std::set<unsigned> > epsilon_map;
+
+        void make_transition(unsigned start, char symbol, unsigned end) {
+            transition_map[start][symbol] = end;
+        }
+
+        void make_epsilon_move(unsigned start, unsigned end) {
+            epsilon_map[start].insert(end);
+        }
+
+        // Convert a regular expression to an e-NFA using Thompson's construction
+        void convert_re(expr * e, unsigned & start, unsigned & end, seq_util & u);
+
+    public:
+        nfa(seq_util & u, expr * e)
+    : m_valid(true), m_next_id(0), m_start_state(0), m_end_state(0) {
+            convert_re(e, m_start_state, m_end_state, u);
+        }
+
+        nfa() : m_valid(false), m_next_id(0), m_start_state(0), m_end_state(0) {}
+
+        bool is_valid() const {
+            return m_valid;
+        }
+
+        void epsilon_closure(unsigned start, std::set<unsigned> & closure);
+
+        bool matches(zstring input);
+    };
+
     class theory_str : public theory {
         struct T_cut
         {
@@ -112,12 +178,12 @@ namespace smt {
         typedef union_find<theory_str> th_union_find;
 
         typedef map<rational, expr*, obj_hash<rational>, default_eq<rational> > rational_map;
-        struct str_hash_proc {
-            unsigned operator()(std::string const & s) const {
-            	return string_hash(s.c_str(), static_cast<unsigned>(s.length()), 17);
+        struct zstring_hash_proc {
+            unsigned operator()(zstring const & s) const {
+            	return string_hash(s.encode().c_str(), static_cast<unsigned>(s.length()), 17);
             }
         };
-        typedef map<std::string, expr*, str_hash_proc, default_eq<std::string> > string_map;
+        typedef map<zstring, expr*, zstring_hash_proc, default_eq<zstring> > string_map;
 
     protected:
         theory_str_params const & m_params;
@@ -190,7 +256,7 @@ namespace smt {
 
         bool search_started;
         arith_util m_autil;
-        str_util m_strutil;
+        seq_util u;
         int sLevel;
 
         bool finalCheckProgressIndicator;
@@ -256,11 +322,10 @@ namespace smt {
 
         theory_str_contain_pair_bool_map_t contain_pair_bool_map;
         //obj_map<expr, obj_pair_set<expr, expr> > contain_pair_idx_map;
-        // TODO Find a better data structure, this is 100% a hack right now
         std::map<expr*, std::set<std::pair<expr*, expr*> > > contain_pair_idx_map;
 
-        std::map<std::pair<expr*, std::string>, expr*> regex_in_bool_map;
-        std::map<expr*, std::set<std::string> > regex_in_var_reg_str_map;
+        std::map<std::pair<expr*, zstring>, expr*> regex_in_bool_map;
+        std::map<expr*, std::set<zstring> > regex_in_var_reg_str_map;
 
         std::map<expr*, nfa> regex_nfa_cache; // Regex term --> NFA
 
@@ -330,7 +395,7 @@ namespace smt {
         void assert_implication(expr * premise, expr * conclusion);
         expr * rewrite_implication(expr * premise, expr * conclusion);
 
-        expr * mk_string(std::string str);
+        expr * mk_string(zstring const& str);
         expr * mk_string(const char * str);
 
         app * mk_strlen(expr * e);
@@ -361,48 +426,6 @@ namespace smt {
         app * mk_unroll_bound_var();
         app * mk_unroll_test_var();
         void add_nonempty_constraint(expr * s);
-
-        bool is_concat(app const * a) const { return a->is_app_of(get_id(), OP_STRCAT); }
-        bool is_concat(enode const * n) const { return is_concat(n->get_owner()); }
-        bool is_string(app const * a) const { return a->is_app_of(get_id(), OP_STR); }
-        bool is_string(enode const * n) const { return is_string(n->get_owner()); }
-        bool is_strlen(app const * a) const { return a->is_app_of(get_id(), OP_STRLEN); }
-        bool is_strlen(enode const * n) const { return is_strlen(n->get_owner()); }
-        bool is_CharAt(app const * a) const { return a->is_app_of(get_id(), OP_STR_CHARAT); }
-        bool is_CharAt(enode const * n) const { return is_CharAt(n->get_owner()); }
-        bool is_StartsWith(app const * a) const { return a->is_app_of(get_id(), OP_STR_STARTSWITH); }
-        bool is_StartsWith(enode const * n) const { return is_StartsWith(n->get_owner()); }
-        bool is_EndsWith(app const * a) const { return a->is_app_of(get_id(), OP_STR_ENDSWITH); }
-        bool is_EndsWith(enode const * n) const { return is_EndsWith(n->get_owner()); }
-        bool is_Contains(app const * a) const { return a->is_app_of(get_id(), OP_STR_CONTAINS); }
-        bool is_Contains(enode const * n) const { return is_Contains(n->get_owner()); }
-        bool is_Indexof(app const * a) const { return a->is_app_of(get_id(), OP_STR_INDEXOF); }
-        bool is_Indexof(enode const * n) const { return is_Indexof(n->get_owner()); }
-        bool is_Indexof2(app const * a) const { return a->is_app_of(get_id(), OP_STR_INDEXOF2); }
-        bool is_Indexof2(enode const * n) const { return is_Indexof2(n->get_owner()); }
-        bool is_LastIndexof(app const * a) const { return a->is_app_of(get_id(), OP_STR_LASTINDEXOF); }
-        bool is_LastIndexof(enode const * n) const { return is_LastIndexof(n->get_owner()); }
-        bool is_Substr(app const * a) const { return a->is_app_of(get_id(), OP_STR_SUBSTR); }
-        bool is_Substr(enode const * n) const { return is_Substr(n->get_owner()); }
-        bool is_Replace(app const * a) const { return a->is_app_of(get_id(), OP_STR_REPLACE); }
-        bool is_Replace(enode const * n) const { return is_Replace(n->get_owner()); }
-        bool is_str_to_int(app const * a) const { return a->is_app_of(get_id(), OP_STR_STR2INT); }
-		bool is_str_to_int(enode const * n) const { return is_str_to_int(n->get_owner()); }
-		bool is_int_to_str(app const * a) const { return a->is_app_of(get_id(), OP_STR_INT2STR); }
-        bool is_int_to_str(enode const * n) const { return is_int_to_str(n->get_owner()); }
-
-        bool is_RegexIn(app const * a) const { return a->is_app_of(get_id(), OP_RE_REGEXIN); }
-        bool is_RegexIn(enode const * n) const { return is_RegexIn(n->get_owner()); }
-        bool is_RegexConcat(app const * a) const { return a->is_app_of(get_id(), OP_RE_REGEXCONCAT); }
-        bool is_RegexConcat(enode const * n) const { return is_RegexConcat(n->get_owner()); }
-        bool is_RegexStar(app const * a) const { return a->is_app_of(get_id(), OP_RE_REGEXSTAR); }
-        bool is_RegexStar(enode const * n) const { return is_RegexStar(n->get_owner()); }
-        bool is_RegexUnion(app const * a) const { return a->is_app_of(get_id(), OP_RE_REGEXUNION); }
-        bool is_RegexUnion(enode const * n) const { return is_RegexUnion(n->get_owner()); }
-        bool is_Str2Reg(app const * a) const { return a->is_app_of(get_id(), OP_RE_STR2REGEX); }
-		bool is_Str2Reg(enode const * n) const { return is_Str2Reg(n->get_owner()); }
-		bool is_Unroll(app const * a) const { return a->is_app_of(get_id(), OP_RE_UNROLL); }
-		bool is_Unroll(enode const * n) const { return is_Unroll(n->get_owner()); }
 
         void instantiate_concat_axiom(enode * cat);
         void try_eval_concat(enode * cat);
@@ -444,7 +467,7 @@ namespace smt {
         bool upper_bound(expr* _e, rational& hi);
 
         bool can_two_nodes_eq(expr * n1, expr * n2);
-        bool can_concat_eq_str(expr * concat, std::string str);
+        bool can_concat_eq_str(expr * concat, zstring& str);
         bool can_concat_eq_concat(expr * concat1, expr * concat2);
         bool check_concat_len_in_eqc(expr * concat);
         bool check_length_consistency(expr * n1, expr * n2);
@@ -458,7 +481,6 @@ namespace smt {
         void check_contain_by_substr(expr * varNode, expr_ref_vector & willEqClass);
         void check_contain_by_eq_nodes(expr * n1, expr * n2);
         bool in_contain_idx_map(expr * n);
-        // TODO refactor these methods to use expr_ref_vector instead of std::vector
         void compute_contains(std::map<expr*, expr*> & varAliasMap,
                 std::map<expr*, expr*> & concatAliasMap, std::map<expr*, expr *> & varConstMap,
                 std::map<expr*, expr*> & concatConstMap, std::map<expr*, std::map<expr*, int> > & varEqConcatMap);
@@ -523,24 +545,24 @@ namespace smt {
         		std::map<expr*, int> & concatMap, std::map<expr*, int> & unrollMap);
 
         expr * mk_internal_lenTest_var(expr * node, int lTries);
-        expr * gen_len_val_options_for_free_var(expr * freeVar, expr * lenTesterInCbEq, std::string lenTesterValue);
+        expr * gen_len_val_options_for_free_var(expr * freeVar, expr * lenTesterInCbEq, zstring lenTesterValue);
         void process_free_var(std::map<expr*, int> & freeVar_map);
         expr * gen_len_test_options(expr * freeVar, expr * indicator, int tries);
         expr * gen_free_var_options(expr * freeVar, expr * len_indicator,
-        		std::string len_valueStr, expr * valTesterInCbEq, std::string valTesterValueStr);
+        		zstring len_valueStr, expr * valTesterInCbEq, zstring valTesterValueStr);
         expr * gen_val_options(expr * freeVar, expr * len_indicator, expr * val_indicator,
-        		std::string lenStr, int tries);
+        		zstring lenStr, int tries);
         void print_value_tester_list(svector<std::pair<int, expr*> > & testerList);
         bool get_next_val_encode(int_vector & base, int_vector & next);
-        std::string gen_val_string(int len, int_vector & encoding);
+        zstring gen_val_string(int len, int_vector & encoding);
 
         // binary search heuristic
-        expr * binary_search_length_test(expr * freeVar, expr * previousLenTester, std::string previousLenTesterValue);
+        expr * binary_search_length_test(expr * freeVar, expr * previousLenTester, zstring previousLenTesterValue);
         expr_ref binary_search_case_split(expr * freeVar, expr * tester, binary_search_info & bounds, literal_vector & case_split_lits);
 
         bool free_var_attempt(expr * nn1, expr * nn2);
-        void more_len_tests(expr * lenTester, std::string lenTesterValue);
-        void more_value_tests(expr * valTester, std::string valTesterValue);
+        void more_len_tests(expr * lenTester, zstring lenTesterValue);
+        void more_value_tests(expr * valTester, zstring valTesterValue);
 
         expr * get_alias_index_ast(std::map<expr*, expr*> & aliasIndexMap, expr * node);
         expr * getMostLeftNodeInConcat(expr * node);
@@ -559,10 +581,11 @@ namespace smt {
         void get_eqc_simpleUnroll(expr * n, expr * &constStr, std::set<expr*> & unrollFuncSet);
         void gen_assign_unroll_reg(std::set<expr*> & unrolls);
         expr * gen_assign_unroll_Str2Reg(expr * n, std::set<expr*> & unrolls);
-        expr * gen_unroll_conditional_options(expr * var, std::set<expr*> & unrolls, std::string lcmStr);
-        expr * gen_unroll_assign(expr * var, std::string lcmStr, expr * testerVar, int l, int h);
+        expr * gen_unroll_conditional_options(expr * var, std::set<expr*> & unrolls, zstring lcmStr);
+        expr * gen_unroll_assign(expr * var, zstring lcmStr, expr * testerVar, int l, int h);
         void reduce_virtual_regex_in(expr * var, expr * regex, expr_ref_vector & items);
         void check_regex_in(expr * nn1, expr * nn2);
+        zstring get_std_regex_str(expr * r);
 
         void dump_assignments();
         void initialize_charset();
@@ -585,7 +608,7 @@ namespace smt {
         theory_str(ast_manager & m, theory_str_params const & params);
         virtual ~theory_str();
 
-        virtual char const * get_name() const { return "strings"; }
+        virtual char const * get_name() const { return "seq"; }
         virtual void display(std::ostream & out) const;
 
         bool overlapping_variables_detected() const { return loopDetected; }

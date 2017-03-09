@@ -59,8 +59,8 @@ src/api/dotnet/Enumerations.cs
 src/api/dotnet/Native.cs
 src/api/dotnet/Properties/AssemblyInfo.cs
 src/api/dotnet/Microsoft.Z3.xml
-src/api/python/z3consts.py
-src/api/python/z3core.py
+src/api/python/z3/z3consts.py
+src/api/python/z3/z3core.py
 src/ast/pattern/database.h
 src/util/version.h
 src/api/java/Native.cpp
@@ -86,11 +86,4 @@ src/*/*/CMakeLists.txt
 src/*/*/*/CMakeLists.txt
 src/api/dotnet/cmake_install_gac.cmake.in
 src/api/dotnet/cmake_uninstall_gac.cmake.in
-
-# reference code for z3str2
-Z3-str
-Z3-str/**
-# test cases
-tests
-tests/**
 

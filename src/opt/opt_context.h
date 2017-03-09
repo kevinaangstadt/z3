@@ -48,7 +48,7 @@ namespace opt {
         virtual filter_model_converter& fm() = 0;   // converter that removes fresh names introduced by simplification.
         virtual bool sat_enabled() const = 0;       // is using th SAT solver core enabled?
         virtual solver& get_solver() = 0;           // retrieve solver object (SAT or SMT solver)
-        virtual ast_manager& get_manager() = 0;      
+        virtual ast_manager& get_manager() const = 0;      
         virtual params_ref& params() = 0;
         virtual void enable_sls(bool force) = 0;              // stochastic local search 
         virtual symbol const& maxsat_engine() const = 0; // retrieve maxsat engine configuration parameter.
@@ -175,6 +175,8 @@ namespace opt {
         unsigned add_objective(app* t, bool is_max);
         void add_hard_constraint(expr* f);
         
+        void get_hard_constraints(expr_ref_vector& hard);
+        expr_ref get_objective(unsigned i);
 
         virtual void push();
         virtual void pop(unsigned n);
@@ -188,7 +190,7 @@ namespace opt {
         virtual void collect_statistics(statistics& stats) const;
         virtual proof* get_proof() { return 0; }
         virtual void get_labels(svector<symbol> & r);
-        virtual void get_unsat_core(ptr_vector<expr> & r) {}
+        virtual void get_unsat_core(ptr_vector<expr> & r);
         virtual std::string reason_unknown() const;
         virtual void set_reason_unknown(char const* msg) { m_unknown = msg; }
 
@@ -205,10 +207,13 @@ namespace opt {
         expr_ref get_lower(unsigned idx);
         expr_ref get_upper(unsigned idx);
 
+        void get_lower(unsigned idx, expr_ref_vector& es) { to_exprs(get_lower_as_num(idx), es); }
+        void get_upper(unsigned idx, expr_ref_vector& es) { to_exprs(get_upper_as_num(idx), es); }
+
         std::string to_string() const;
 
 
-        virtual unsigned num_objectives() { return m_objectives.size(); }
+        virtual unsigned num_objectives() { return m_scoped_state.m_objectives.size(); }       
         virtual expr_ref mk_gt(unsigned i, model_ref& model);
         virtual expr_ref mk_ge(unsigned i, model_ref& model);
         virtual expr_ref mk_le(unsigned i, model_ref& model);
@@ -217,7 +222,7 @@ namespace opt {
         virtual filter_model_converter& fm() { return m_fm; }
         virtual bool sat_enabled() const { return 0 != m_sat_solver.get(); }
         virtual solver& get_solver();
-        virtual ast_manager& get_manager() { return this->m; }
+        virtual ast_manager& get_manager() const { return this->m; }
         virtual params_ref& params() { return m_params; }
         virtual void enable_sls(bool force);
         virtual symbol const& maxsat_engine() const { return m_maxsat_engine; }
@@ -236,6 +241,7 @@ namespace opt {
         lbool adjust_unknown(lbool r);
         bool scoped_lex();
         expr_ref to_expr(inf_eps const& n);
+        void to_exprs(inf_eps const& n, expr_ref_vector& es);
 
         void reset_maxsmts();
         void import_scoped_state();
@@ -284,8 +290,12 @@ namespace opt {
         void display_objective(std::ostream& out, objective const& obj) const;
         void display_bounds(std::ostream& out, bounds_t const& b) const;
 
+        std::string to_string(expr_ref_vector const& hard, vector<objective> const& objectives) const;
+        std::string to_string_internal() const;
+
 
         void validate_lex();
+        void validate_maxsat(symbol const& id);
 
         void display_benchmark();
 
